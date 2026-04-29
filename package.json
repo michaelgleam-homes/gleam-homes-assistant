@@ -1,0 +1,32 @@
+ 
+{
+  "name": "gleam-homes-guest-assistant",
+  "version": "1.0.0",
+  "description": "AI Guest Assistant für Gleam Homes Ferienwohnungen",
+  "main": "gleam-homes-backend.js",
+  "scripts": {
+    "start": "node gleam-homes-backend.js",
+    "dev": "nodemon gleam-homes-backend.js"
+  },
+  "keywords": [
+    "gleam-homes",
+    "ferienwohnung",
+    "guest-assistant",
+    "bot",
+    "smoobu"
+  ],
+  "author": "Michael Gesierich",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.2",
+    "dotenv": "^16.3.1",
+    "mailtrap": "^3.4.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
