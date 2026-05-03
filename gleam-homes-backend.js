@@ -1,18 +1,6 @@
 /**
- * GLEAM HOMES GUEST ASSISTANT - BACKEND v2.7 CLEAN
- * Production Ready Version
- * 
- * LOGIC ORDER (CRITICAL):
- * 1. Check message age (>1h) → SKIP old messages
- * 2. Check 30min silence (only if Michael responded to guest question)
- * 3. Process guest message normally
- * 
- * - Critical Problems Detection (Alert only, no auto-response)
- * - Conservative Confidence Threshold (0.75 instead of 0.85)
- * - Manual Override (30min silence ONLY when Michael responds to guest)
- * - 1 Hour Message Age Filter
- * - Language Detection: German → DE, Others → EN
- * - Smart Fallback System
+ * GLEAM HOMES GUEST ASSISTANT - BACKEND v2.8 DEBUG
+ * Detailed logging to diagnose message type, age, and processing
  */
 require('dotenv').config();
 const express = require('express');
@@ -22,17 +10,16 @@ const { MailtrapClient } = require('mailtrap');
 const app = express();
 app.use(express.json());
 
-// ─── CONFIGURATION ────────────────────────────────────────────────────────
 const SMOOBU_API_KEY = process.env.SMOOBU_API_KEY;
 const MAILTRAP_API_TOKEN = process.env.MAILTRAP_API_TOKEN || 'b785c3d3b2d8ff0547d1d8b5b824eb91';
 const ALERT_EMAIL = process.env.ALERT_EMAIL || 'michaelgesierich@gmail.com';
 const NTFY_CHANNEL = process.env.NTFY_CHANNEL || 'gleam-homes-michael';
 const BOT_NAME = 'Lisa von Gleam Homes';
-const POLL_INTERVAL_MS = 1 * 60 * 1000; // 1 Minute
+const POLL_INTERVAL_MS = 1 * 60 * 1000;
 const SMOOBU_BASE = 'https://login.smoobu.com/api';
-const MESSAGE_AGE_LIMIT_HOURS = 1; // 1 HOUR - ignore old messages
-const CONFIDENCE_THRESHOLD = 0.75; // Conservative threshold
-const MANUAL_OVERRIDE_MINUTES = 30; // Silence when Michael responds to guest
+const MESSAGE_AGE_LIMIT_HOURS = 1;
+const CONFIDENCE_THRESHOLD = 0.75;
+const MANUAL_OVERRIDE_MINUTES = 30;
 
 const APARTMENTS = [
   { id: 2878246, name: 'Boutique-Apartment Dresden-Hafencity' },
@@ -46,10 +33,8 @@ const mailtrapClient = new MailtrapClient({ token: MAILTRAP_API_TOKEN });
 const sender = { email: 'bot@gleam-homes.com', name: BOT_NAME };
 
 const SIGNATURE_DE = `Viele Grüße,\nLisa von Gleam Homes\nMichael überwacht alle Anfragen und meldet sich bei Bedarf`;
-
 const SIGNATURE_EN = `Best regards,\nLisa from Gleam Homes\nMichael monitors all inquiries and will reach out if needed`;
 
-// ─── CRITICAL PROBLEMS (Alert only, no auto-response) ──────────────────────
 const CRITICAL_PROBLEMS = [
   'garagentor', 'garage nicht', 'vor der tür', 'code geht nicht', 
   'code funktioniert nicht', 'kein internet', 'wifi geht nicht', 'wlan geht nicht',
@@ -65,7 +50,6 @@ function isCriticalProblem(text) {
   return CRITICAL_PROBLEMS.some(keyword => lowerText.includes(keyword));
 }
 
-// ─── LANGUAGE DETECTION - GERMAN OR ENGLISH DEFAULT ────────────────────────
 function detectLanguage(text) {
   const germanIndicators = text.match(/[äöüß]/g) || [];
   if (germanIndicators.length > 0) return 'de';
@@ -79,7 +63,6 @@ function detectLanguage(text) {
   return 'en';
 }
 
-// ─── FAQ DATABASE (GERMAN) ────────────────────────────────────────────────
 const FAQ_DATABASE_DE = {
   checkInEarly: {
     keywords: ['früher', 'früh einchecken', '13 uhr', '14 uhr', '15 uhr', 'ankunft', 'einchecken'],
@@ -138,57 +121,11 @@ const FAQ_DATABASE_DE = {
   }
 };
 
-// ─── FAQ DATABASE (ENGLISH) ───────────────────────────────────────────────
 const FAQ_DATABASE_EN = {
-  checkInEarly: {
-    keywords: ['early', 'earlier', 'arrive', 'check-in', '1pm', '2pm', '3pm'],
-    confidence: 0.92,
-    response: (name) => `Hi ${name},\n\ngreat that you're arriving earlier! Let me check what's possible.\n\nEarly check-in fees:\n- From 1:00 PM: €25\n- From 2:00 PM: €15\n- Standard from 4:00 PM: free\n\nWhich option would you prefer?\n\n${SIGNATURE_EN}`
-  },
   checkInStandard: {
     keywords: ['when', 'checkin', 'check in', 'arrival', 'arrive'],
     confidence: 0.95,
-    response: (name) => `Hi ${name},\n\nof course! Standard check-in is available from 4:00 PM.\n\nHere's how it works on arrival:\n1. Main door: touchscreen → enter "Apartment 52" → door opens\n2. Take the lift to the 3rd floor\n3. Apartment door: Nuki keypad → enter your 6-digit code\n\nYou'll receive the code automatically 24 hours before arrival.\n\nIf you're arriving earlier, just let me know!\n\n${SIGNATURE_EN}`
-  },
-  keypad: {
-    keywords: ['code', 'keypad', 'nuki', 'key', 'access', 'password'],
-    confidence: 0.95,
-    response: (name) => `Hi ${name},\n\naccess is completely contactless:\n\nMain door:\n1. Touchscreen → enter "Apartment 52"\n2. Door opens in about 3 seconds\n3. Take the lift to the 3rd floor\n\nApartment door:\n1. Nuki keypad (black panel)\n2. Enter your 6-digit code\n3. You're in!\n\nYou'll receive the code 24 hours before arrival.\n\n${SIGNATURE_EN}`
-  },
-  wifi: {
-    keywords: ['wifi', 'internet', 'password', 'network', 'qr'],
-    confidence: 0.94,
-    response: (name) => `Hi ${name},\n\nyou can find the WiFi password in two ways:\n\nOption 1: Scan the QR code in the hallway\n\nOption 2: Manual entry\n- Network: Gleam-Guest\n- Password: gleam2025!\n\n${SIGNATURE_EN}`
-  },
-  parking: {
-    keywords: ['parking', 'car', 'garage', 'spot', 'space'],
-    confidence: 0.95,
-    response: (name) => `Hi ${name},\n\nyour parking spot is #138 in the underground garage.\n\nEntrance: in the middle between the building blocks\nThe garage opener is in the apartment.\n\n${SIGNATURE_EN}`
-  },
-  checkout: {
-    keywords: ['checkout', 'departure', 'when', 'leave', 'late'],
-    confidence: 0.94,
-    response: (name) => `Hi ${name},\n\nstandard check-out is until 11:00 AM.\n\nLate check-out available:\n- Until 2:00 PM: €35\n- Until 6:00 PM: €60\n\nJust let me know if you need an option!\n\n${SIGNATURE_EN}`
-  },
-  restaurants: {
-    keywords: ['restaurant', 'eat', 'food', 'recommendation', 'cafe', 'bar'],
-    confidence: 0.88,
-    response: (name) => `Hi ${name},\n\nI'd love to give you some tips! Just tell me what you like and I'll share my personal favorites!\n\n${SIGNATURE_EN}`
-  },
-  breakfast: {
-    keywords: ['breakfast', 'morning', 'coffee', 'eat'],
-    confidence: 0.92,
-    response: (name) => `Hi ${name},\n\nbreakfast is not included, but the apartment has a fully equipped kitchen!\n\nThere are great cafés and bakeries nearby.\n\n${SIGNATURE_EN}`
-  },
-  pets: {
-    keywords: ['pet', 'dog', 'cat', 'animal', 'pets'],
-    confidence: 1.0,
-    response: (name) => `Hi ${name},\n\nunfortunately, pets are not allowed in our apartments.\n\nFor special cases, feel free to reach out!\n\n${SIGNATURE_EN}`
-  },
-  cancellation: {
-    keywords: ['cancel', 'cancellation', 'refund', 'cancel booking'],
-    confidence: 1.0,
-    response: (name) => `Hi ${name},\n\nfor your cancellation request, Michael will handle it personally!\n\nHe'll get back to you as soon as possible.\n\n${SIGNATURE_EN}`
+    response: (name) => `Hi ${name},\n\nof course! Standard check-in is available from 4:00 PM.\n\n${SIGNATURE_EN}`
   },
   general: {
     keywords: [],
@@ -197,7 +134,6 @@ const FAQ_DATABASE_EN = {
   }
 };
 
-// ─── SMART MESSAGE FILTERING ─────────────────────────────────────────────
 function shouldIgnoreMessage(text) {
   const ignorePatterns = [
     /^(danke|thanks|thank you|ok|okay|alles klar|all good|👍|👌)$/i,
@@ -209,14 +145,12 @@ function shouldIgnoreMessage(text) {
   return ignorePatterns.some(pattern => pattern.test(text.trim()));
 }
 
-// ─── MESSAGE AGE CHECK (1 HOUR) ──────────────────────────────────────────
 function isMessageTooOld(messageTimestamp) {
   const now = new Date();
   const ageHours = (now - new Date(messageTimestamp)) / (1000 * 60 * 60);
   return ageHours > MESSAGE_AGE_LIMIT_HOURS;
 }
 
-// ─── COMPLAINT DETECTION ──────────────────────────────────────────────────
 function isComplaint(text) {
   const complaintKeywords = ['schmutzig', 'dirty', 'kaputt', 'broken', 'funktioniert nicht', 'doesn\'t work', 'beschwerde', 'complaint', 'problem'];
   return complaintKeywords.some(keyword => text.toLowerCase().includes(keyword));
@@ -227,7 +161,6 @@ function isReview(text) {
   return reviewKeywords.some(keyword => text.toLowerCase().includes(keyword));
 }
 
-// ─── CATEGORIZATION ──────────────────────────────────────────────────────
 function categorizeQuestion(text, language = 'de') {
   const faqDb = language === 'en' ? FAQ_DATABASE_EN : FAQ_DATABASE_DE;
   const lowerText = text.toLowerCase();
@@ -241,7 +174,6 @@ function categorizeQuestion(text, language = 'de') {
   return { key: 'general', faq: faqDb.general, confidence: 0.3 };
 }
 
-// ─── ALERT SYSTEM ────────────────────────────────────────────────────────
 async function sendNtfyAlert(title, message, priority = 'default') {
   try {
     await axios.post(`https://ntfy.sh/${NTFY_CHANNEL}`, message, {
@@ -277,7 +209,6 @@ async function sendAlertEmail(guestName, guestQuestion, type, apartmentName) {
   }
 }
 
-// ─── MAIN PROCESSING ─────────────────────────────────────────────────────
 async function processGuestMessage(guestName, guestQuestion, apartmentName, isStorniert = false) {
   const firstName = guestName.split(' ')[0];
   
@@ -289,7 +220,6 @@ async function processGuestMessage(guestName, guestQuestion, apartmentName, isSt
     return { type: 'IGNORE' };
   }
 
-  // CRITICAL PROBLEMS: Alert only, no auto-response
   if (isCriticalProblem(guestQuestion)) {
     await sendNtfyAlert(`🚨 KRITISCH: ${firstName}`, guestQuestion, 'urgent');
     await sendAlertEmail(guestName, guestQuestion, 'CRITICAL', apartmentName);
@@ -312,12 +242,10 @@ async function processGuestMessage(guestName, guestQuestion, apartmentName, isSt
   const language = detectLanguage(guestQuestion);
   const { faq, confidence } = categorizeQuestion(guestQuestion, language);
 
-  // CONSERVATIVE: >0.75 threshold
   if (confidence > CONFIDENCE_THRESHOLD) {
     return { type: 'AUTO_RESPONSE', message: faq.response(firstName) };
   }
 
-  // UNSURE: Send alert to Michael
   await sendNtfyAlert(`❓ FRAGE: ${firstName}`, guestQuestion);
   await sendAlertEmail(guestName, guestQuestion, 'QUESTION', apartmentName);
   const fallback = language === 'en'
@@ -326,7 +254,6 @@ async function processGuestMessage(guestName, guestQuestion, apartmentName, isSt
   return { type: 'FALLBACK_WITH_ALERT', message: fallback };
 }
 
-// ─── SMOOBU API ──────────────────────────────────────────────────────────
 const smoobuHeaders = {
   'Api-Key': SMOOBU_API_KEY,
   'Content-Type': 'application/json',
@@ -373,15 +300,23 @@ async function getReservationMessages(reservationId) {
 
 async function sendMessageToGuest(reservationId, messageBody) {
   try {
-    await axios.post(
+    console.log(`📤 Sende an ${reservationId}: "${messageBody.substring(0, 50)}..."`);
+    
+    const response = await axios.post(
       `${SMOOBU_BASE}/reservations/${reservationId}/messages/send-message-to-guest`,
       { messageBody },
       { headers: smoobuHeaders }
     );
-    console.log(`✅ ${reservationId}`);
+    
+    console.log(`✅ SUCCESS ${reservationId}: status=${response.status}`);
     return { success: true };
   } catch (error) {
-    console.error(`❌ Send:`, error.response?.status);
+    console.error(`❌ FEHLER ${reservationId}:`, {
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data,
+      message: error.message
+    });
     return { success: false };
   }
 }
@@ -399,7 +334,6 @@ async function pollAllApartments() {
       const bookingId = booking.id;
       const now = new Date();
 
-      // CHECK: 3-minute buffer since last bot response
       if (lastBotResponseTime.has(bookingId)) {
         const lastResponseTime = lastBotResponseTime.get(bookingId);
         const secondsSinceResponse = (now - lastResponseTime) / 1000;
@@ -420,57 +354,64 @@ async function pollAllApartments() {
       const text = lastMsg.message?.trim();
       if (!text) continue;
 
-      // ✅ LOGIC ORDER - CRITICAL!
-      // 1. CHECK MESSAGE AGE FIRST (>1 HOUR) ─────────────────────────────
+      // ✅ DEBUG: Log message details
+      console.log(`\n📝 DEBUG ${firstName}:`);
+      console.log(`   ID: ${lastMsg.id}`);
+      console.log(`   Type: ${lastMsg.type} (1=guest, 2=host)`);
+      console.log(`   Created: ${lastMsg.created || lastMsg.createdAt}`);
+      console.log(`   Message: "${text.substring(0, 50)}..."`);
+
+      // CHECK MESSAGE AGE FIRST
       if (isMessageTooOld(lastMsg.created || lastMsg.createdAt)) {
         processedMessageIds.add(msgId);
-        console.log(`  ⊘ ${firstName}: Zu alt (>1h)`);
+        console.log(`   → ZU ALT (>1h)`);
         continue;
       }
 
-      // 2. CHECK 30MIN SILENCE (only if Michael responded to guest question) ──────
+      // CHECK 30MIN SILENCE
       if (lastMsg.type === 2) {
-        // Check if there's a guest message BEFORE this host message
         const guestMessageExists = messages.length > 1 && messages[messages.length - 2]?.type === 1;
         
         if (guestMessageExists) {
-          // ✅ Michael has responded to a guest question → activate 30min silence
           manuallyHandledBookings.set(bookingId, now);
-          console.log(`  ⊘ ${firstName}: Michael antwortet (30min Stille)`);
+          console.log(`   → MICHAEL ANTWORTET (30min Stille)`);
           continue;
         } else {
-          // ✅ Just a booking confirmation, no guest question before → ignore
           processedMessageIds.add(msgId);
-          console.log(`  ⊘ ${firstName}: Nur Buchungsbestätigung`);
+          console.log(`   → NUR BUCHUNGSBESTÄTIGUNG`);
           continue;
         }
       }
 
-      // 3. CHECK IF IN 30MIN SILENCE PERIOD ───────────────────────────
+      // CHECK IF IN SILENCE
       if (manuallyHandledBookings.has(bookingId)) {
         const lastManualTime = manuallyHandledBookings.get(bookingId);
         const minutesSinceManual = (now - lastManualTime) / (1000 * 60);
         if (minutesSinceManual < MANUAL_OVERRIDE_MINUTES) {
-          console.log(`  ⊘ ${firstName}: 30min Stille (${Math.round(MANUAL_OVERRIDE_MINUTES - minutesSinceManual)}min)`);
+          console.log(`   → IN 30MIN STILLE (${Math.round(MANUAL_OVERRIDE_MINUTES - minutesSinceManual)}min)`);
           continue;
         } else {
           manuallyHandledBookings.delete(bookingId);
         }
       }
 
-      // 4. PROCESS GUEST MESSAGE NORMALLY ────────────────────────────────
+      // PROCESS MESSAGE
+      console.log(`   → VERARBEITE...`);
       const result = await processGuestMessage(booking['guest-name'], text, apt.name, booking.type === 'cancellation');
 
       if (result.message) {
+        console.log(`   → Sende ${result.type}`);
         const sent = await sendMessageToGuest(bookingId, result.message);
         if (sent.success) {
           processedMessageIds.add(msgId);
           lastBotResponseTime.set(bookingId, now);
-          console.log(`  → ${firstName}: ${result.type}`);
+          console.log(`   ✅ ERFOLG`);
+        } else {
+          console.log(`   ❌ SEND FEHLER`);
         }
       } else {
         processedMessageIds.add(msgId);
-        console.log(`  → ${firstName}: ${result.type}`);
+        console.log(`   → ${result.type}`);
       }
     }
   }
@@ -478,19 +419,16 @@ async function pollAllApartments() {
 
 function startPolling() {
   console.log(`⏱️ Polling alle ${POLL_INTERVAL_MS / 60000}min`);
-  console.log(`🔧 Settings: Confidence >0.75 | Message Age <1h | Manual Override 30min (guest-only)`);
-  console.log(`✅ LOGIC ORDER: 1.Age Check 2.30min Silence (guest-only) 3.Process`);
+  console.log(`🔧 v2.8 DEBUG: Detailliertes Logging aktiviert`);
   pollAllApartments();
   setInterval(pollAllApartments, POLL_INTERVAL_MS);
 }
 
-// ─── ENDPOINTS ───────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({
     status: 'OK',
-    version: '2.7',
+    version: '2.8 DEBUG',
     apartments: APARTMENTS.length,
-    processedMessages: processedMessageIds.size,
     timestamp: new Date().toISOString()
   });
 });
@@ -500,14 +438,10 @@ app.post('/poll/now', async (req, res) => {
   res.json({ success: true });
 });
 
-// ─── START ───────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\n🚀 GLEAM HOMES v2.7 CLEAN auf Port ${PORT}`);
-  console.log(`✨ ${BOT_NAME} | DE/EN | Production Ready`);
-  console.log(`🛡️ Conservative: Confidence >0.75 | 1h Message Age | Critical Problems Alerts`);
-  console.log(`🤖 Manual Override: 30min Silence (nur wenn Michael auf Gäste antwortet) | 3min Buffer`);
-  console.log(`✅ CLEAN LOGIC: Age Check → 30min Silence → Process`);
+  console.log(`\n🚀 GLEAM HOMES v2.8 DEBUG auf Port ${PORT}`);
+  console.log(`✨ Detailliertes Message-Logging aktiviert`);
   startPolling();
 });
 
