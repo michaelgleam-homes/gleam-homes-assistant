@@ -1,11 +1,12 @@
 /**
- * GLEAM HOMES GUEST ASSISTANT - BACKEND v2.3
- * Final Optimized Version
- * - Language Detection (DE/EN)
- * - Smart Alert System (ntfy.sh)
- * - Professional Tone with Michael Signature
- * - 1-Minute Polling
- * - First Name Only
+ * GLEAM HOMES GUEST ASSISTANT - BACKEND v2.5 FINAL
+ * Production Ready Version
+ * - Critical Problems Detection (Alert only, no auto-response)
+ * - Conservative Confidence Threshold (0.75 instead of 0.85)
+ * - Manual Override (30min silence when Michael responds)
+ * - 1 Hour Message Age Filter
+ * - Language Detection: German → DE, Others → EN
+ * - Smart Fallback System
  */
 require('dotenv').config();
 const express = require('express');
@@ -23,12 +24,17 @@ const NTFY_CHANNEL = process.env.NTFY_CHANNEL || 'gleam-homes-michael';
 const BOT_NAME = 'Lisa von Gleam Homes';
 const POLL_INTERVAL_MS = 1 * 60 * 1000; // 1 Minute
 const SMOOBU_BASE = 'https://login.smoobu.com/api';
+const MESSAGE_AGE_LIMIT_HOURS = 1; // 1 HOUR - ignore old messages
+const CONFIDENCE_THRESHOLD = 0.75; // Conservative threshold
+const MANUAL_OVERRIDE_MINUTES = 30; // Silence when Michael responds
 
 const APARTMENTS = [
   { id: 2878246, name: 'Boutique-Apartment Dresden-Hafencity' },
 ];
 
 const processedMessageIds = new Set();
+const lastBotResponseTime = new Map(); // Track when bot last responded to booking
+const manuallyHandledBookings = new Map(); // Track when Michael responds
 
 const mailtrapClient = new MailtrapClient({ token: MAILTRAP_API_TOKEN });
 const sender = { email: 'bot@gleam-homes.com', name: BOT_NAME };
@@ -37,16 +43,34 @@ const SIGNATURE_DE = `Viele Grüße,\nLisa von Gleam Homes\nMichael überwacht a
 
 const SIGNATURE_EN = `Best regards,\nLisa from Gleam Homes\nMichael monitors all inquiries and will reach out if needed`;
 
-// ─── LANGUAGE DETECTION ───────────────────────────────────────────────────
+// ─── CRITICAL PROBLEMS (Alert only, no auto-response) ──────────────────────
+const CRITICAL_PROBLEMS = [
+  'garagentor', 'garage nicht', 'vor der tür', 'code geht nicht', 
+  'code funktioniert nicht', 'kein internet', 'wifi geht nicht', 'wlan geht nicht',
+  'heizung nicht', 'heizung funktioniert', 'rollläden nicht', 'rollläden funktioniert',
+  'markise nicht', 'markise funktioniert', 'aufzug nicht', 'aufzug funktioniert',
+  'wasser nicht', 'kein wasser', 'strom nicht', 'kein strom',
+  'schloss', 'schloss funktioniert', 'türöffner nicht', 'toilette kaputt', 'dusche nicht',
+  'notfall', 'emergency', 'wasserschaden', 'flood'
+];
+
+function isCriticalProblem(text) {
+  const lowerText = text.toLowerCase();
+  return CRITICAL_PROBLEMS.some(keyword => lowerText.includes(keyword));
+}
+
+// ─── LANGUAGE DETECTION - GERMAN OR ENGLISH DEFAULT ────────────────────────
 function detectLanguage(text) {
-  const germanWords = ['ich', 'die', 'der', 'das', 'ein', 'eine', 'wann', 'wie', 'was', 'wo', 'dank', 'danke'];
-  const englishWords = ['i', 'the', 'a', 'an', 'when', 'how', 'what', 'where', 'thanks', 'thank'];
+  const germanIndicators = text.match(/[äöüß]/g) || [];
+  if (germanIndicators.length > 0) return 'de';
+  
+  const germanWords = ['danke', 'hallo', 'guten', 'schreib', 'code', 'nuki', 'wifi', 'wlan', 'parkplatz', 'zimmer', 'checkin', 'auschecken', 'aufenthalt', 'früh', 'ankunft', 'abreise', 'schlüssel', 'tür', 'wohnung'];
   
   const lowerText = text.toLowerCase();
   const germanCount = germanWords.filter(w => lowerText.includes(w)).length;
-  const englishCount = englishWords.filter(w => lowerText.includes(w)).length;
   
-  return englishCount > germanCount ? 'en' : 'de';
+  if (germanCount >= 1) return 'de';
+  return 'en';
 }
 
 // ─── FAQ DATABASE (GERMAN) ────────────────────────────────────────────────
@@ -171,20 +195,22 @@ const FAQ_DATABASE_EN = {
 function shouldIgnoreMessage(text) {
   const ignorePatterns = [
     /^(danke|thanks|thank you|ok|okay|alles klar|all good|👍|👌)$/i,
-    /^(ja|yes|yep|sure|klar|natürlich|gerne)$/i,
-    /^(nein|no|nope)$/i,
+    /^(ja|yes|yep|sure|klar|natürlich|gerne|si|da|tak|да)$/i,
+    /^(nein|no|nope|nie|nee|не|nie)$/i,
     /.*danke.*(aufenthalt|stay|time).*/i,
   ];
   
   return ignorePatterns.some(pattern => pattern.test(text.trim()));
 }
 
-// ─── URGENT & COMPLAINT DETECTION ─────────────────────────────────────────
-function isUrgent(text) {
-  const urgentKeywords = ['notfall', 'emergency', 'eingeschlossen', 'locked', 'wasserschaden', 'flood', 'heizung nicht', 'heating broken'];
-  return urgentKeywords.some(keyword => text.toLowerCase().includes(keyword));
+// ─── MESSAGE AGE CHECK (1 HOUR) ──────────────────────────────────────────
+function isMessageTooOld(messageTimestamp) {
+  const now = new Date();
+  const ageHours = (now - new Date(messageTimestamp)) / (1000 * 60 * 60);
+  return ageHours > MESSAGE_AGE_LIMIT_HOURS;
 }
 
+// ─── COMPLAINT DETECTION ──────────────────────────────────────────────────
 function isComplaint(text) {
   const complaintKeywords = ['schmutzig', 'dirty', 'kaputt', 'broken', 'funktioniert nicht', 'doesn\'t work', 'beschwerde', 'complaint', 'problem'];
   return complaintKeywords.some(keyword => text.toLowerCase().includes(keyword));
@@ -228,15 +254,15 @@ async function sendNtfyAlert(title, message, priority = 'default') {
 
 async function sendAlertEmail(guestName, guestQuestion, type, apartmentName) {
   try {
-    const subject = type === 'URGENT' 
-      ? `🚨 NOTFALL: ${guestName}`
-      : `⚠️ ${type}: ${guestName}`;
+    const subject = type === 'CRITICAL' 
+      ? `🚨 KRITISCHES PROBLEM: ${guestName}`
+      : `❓ FRAGE: ${guestName}`;
     
     await mailtrapClient.send({
       from: sender,
       to: [{ email: ALERT_EMAIL }],
       subject: subject,
-      text: `${guestName} (${apartmentName})\n\n"${guestQuestion}"\n\nBitte antworten!`
+      text: `${guestName} (${apartmentName})\n\n"${guestQuestion}"\n\nBitte persönlich antworten!`
     });
     return true;
   } catch (error) {
@@ -257,14 +283,18 @@ async function processGuestMessage(guestName, guestQuestion, apartmentName, isSt
     return { type: 'IGNORE' };
   }
 
-  if (isUrgent(guestQuestion)) {
-    await sendNtfyAlert(`🚨 ${firstName}`, guestQuestion, 'urgent');
-    await sendAlertEmail(guestName, guestQuestion, 'URGENT', apartmentName);
-    return { type: 'URGENT_ALERT' };
+  // CRITICAL PROBLEMS: Alert only, no auto-response
+  if (isCriticalProblem(guestQuestion)) {
+    await sendNtfyAlert(`🚨 KRITISCH: ${firstName}`, guestQuestion, 'urgent');
+    await sendAlertEmail(guestName, guestQuestion, 'CRITICAL', apartmentName);
+    const fallback = detectLanguage(guestQuestion) === 'en'
+      ? `Hi ${firstName},\n\nI'm reaching out to Michael immediately!\n\n${SIGNATURE_EN}`
+      : `Hallo ${firstName},\n\nMichael kümmert sich sofort!\n\n${SIGNATURE_DE}`;
+    return { type: 'CRITICAL_ALERT', message: fallback };
   }
 
   if (isComplaint(guestQuestion)) {
-    await sendNtfyAlert(`⚠️ ${firstName}`, guestQuestion, 'high');
+    await sendNtfyAlert(`⚠️ BESCHWERDE: ${firstName}`, guestQuestion, 'high');
     await sendAlertEmail(guestName, guestQuestion, 'COMPLAINT', apartmentName);
     return { type: 'COMPLAINT_ALERT' };
   }
@@ -276,23 +306,18 @@ async function processGuestMessage(guestName, guestQuestion, apartmentName, isSt
   const language = detectLanguage(guestQuestion);
   const { faq, confidence } = categorizeQuestion(guestQuestion, language);
 
-  if (confidence > 0.85) {
+  // CONSERVATIVE: >0.75 threshold
+  if (confidence > CONFIDENCE_THRESHOLD) {
     return { type: 'AUTO_RESPONSE', message: faq.response(firstName) };
   }
 
-  if (confidence < 0.60) {
-    await sendNtfyAlert(`❓ ${firstName}`, guestQuestion);
-    await sendAlertEmail(guestName, guestQuestion, 'QUESTION', apartmentName);
-    const fallback = language === 'en'
-      ? `Hi ${firstName},\n\nthanks for your question! Michael will reach out personally.\n\n${SIGNATURE_EN}`
-      : `Hallo ${firstName},\n\nvielen Dank für deine Frage! Michael meldet sich persönlich.\n\n${SIGNATURE_DE}`;
-    return { type: 'FALLBACK_WITH_ALERT', message: fallback };
-  }
-
+  // UNSURE: Send alert to Michael
+  await sendNtfyAlert(`❓ FRAGE: ${firstName}`, guestQuestion);
+  await sendAlertEmail(guestName, guestQuestion, 'QUESTION', apartmentName);
   const fallback = language === 'en'
-    ? `Hi ${firstName},\n\nthanks for your message!\n\n${SIGNATURE_EN}`
-    : `Hallo ${firstName},\n\ndanke für deine Nachricht!\n\n${SIGNATURE_DE}`;
-  return { type: 'FALLBACK', message: fallback };
+    ? `Hi ${firstName},\n\nthanks for your question! Michael will reach out personally.\n\n${SIGNATURE_EN}`
+    : `Hallo ${firstName},\n\nvielen Dank für deine Frage! Michael meldet sich persönlich.\n\n${SIGNATURE_DE}`;
+  return { type: 'FALLBACK_WITH_ALERT', message: fallback };
 }
 
 // ─── SMOOBU API ──────────────────────────────────────────────────────────
@@ -342,7 +367,7 @@ async function getReservationMessages(reservationId) {
 
 async function sendMessageToGuest(reservationId, messageBody) {
   try {
-    const response = await axios.post(
+    await axios.post(
       `${SMOOBU_BASE}/reservations/${reservationId}/messages/send-message-to-guest`,
       { messageBody },
       { headers: smoobuHeaders }
@@ -365,24 +390,64 @@ async function pollAllApartments() {
 
     for (const booking of bookings) {
       const firstName = booking['guest-name'].split(' ')[0];
-      const messages = await getReservationMessages(booking.id);
+      const bookingId = booking.id;
+      const now = new Date();
+
+      // CHECK: Is Michael currently handling this booking?
+      if (manuallyHandledBookings.has(bookingId)) {
+        const lastManualTime = manuallyHandledBookings.get(bookingId);
+        const minutesSinceManual = (now - lastManualTime) / (1000 * 60);
+        if (minutesSinceManual < MANUAL_OVERRIDE_MINUTES) {
+          console.log(`  ⊘ ${firstName}: Michael kümmert sich (${Math.round(MANUAL_OVERRIDE_MINUTES - minutesSinceManual)}min)`);
+          continue;
+        } else {
+          manuallyHandledBookings.delete(bookingId);
+        }
+      }
+
+      // CHECK: 3-minute buffer since last bot response
+      if (lastBotResponseTime.has(bookingId)) {
+        const lastResponseTime = lastBotResponseTime.get(bookingId);
+        const secondsSinceResponse = (now - lastResponseTime) / 1000;
+        if (secondsSinceResponse < 3 * 60) {
+          console.log(`  ⊘ ${firstName}: 3min Buffer`);
+          continue;
+        }
+      }
+
+      const messages = await getReservationMessages(bookingId);
       if (!messages.length) continue;
 
       const lastMsg = messages[messages.length - 1];
-      if (!lastMsg || lastMsg.type !== 1) continue;
+      if (!lastMsg || !lastMsg.message) continue;
 
-      const msgId = `${booking.id}-${lastMsg.id}`;
+      // CHECK: Is last message from Michael (Host)?
+      if (lastMsg.type === 2) {
+        manuallyHandledBookings.set(bookingId, now);
+        console.log(`  ⊘ ${firstName}: Michael antwortet (30min Stille)`);
+        continue;
+      }
+
+      const msgId = `${bookingId}-${lastMsg.id}`;
       if (processedMessageIds.has(msgId)) continue;
 
       const text = lastMsg.message?.trim();
       if (!text) continue;
 
+      // CHECK: Message too old (>1 hour)?
+      if (isMessageTooOld(lastMsg.created || lastMsg.createdAt)) {
+        processedMessageIds.add(msgId);
+        console.log(`  ⊘ ${firstName}: Zu alt (>1h)`);
+        continue;
+      }
+
       const result = await processGuestMessage(booking['guest-name'], text, apt.name, booking.type === 'cancellation');
 
       if (result.message) {
-        const sent = await sendMessageToGuest(booking.id, result.message);
+        const sent = await sendMessageToGuest(bookingId, result.message);
         if (sent.success) {
           processedMessageIds.add(msgId);
+          lastBotResponseTime.set(bookingId, now);
           console.log(`  → ${firstName}: ${result.type}`);
         }
       } else {
@@ -395,6 +460,7 @@ async function pollAllApartments() {
 
 function startPolling() {
   console.log(`⏱️ Polling alle ${POLL_INTERVAL_MS / 60000}min`);
+  console.log(`🔧 Settings: Confidence >0.75 | Message Age <1h | Manual Override 30min`);
   pollAllApartments();
   setInterval(pollAllApartments, POLL_INTERVAL_MS);
 }
@@ -403,7 +469,7 @@ function startPolling() {
 app.get('/health', (req, res) => {
   res.json({
     status: 'OK',
-    version: '2.3',
+    version: '2.5',
     apartments: APARTMENTS.length,
     processedMessages: processedMessageIds.size,
     timestamp: new Date().toISOString()
@@ -418,8 +484,10 @@ app.post('/poll/now', async (req, res) => {
 // ─── START ───────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\n🚀 GLEAM HOMES v2.3 auf Port ${PORT}`);
-  console.log(`✨ ${BOT_NAME} | DE/EN | ntfy + Email`);
+  console.log(`\n🚀 GLEAM HOMES v2.5 FINAL auf Port ${PORT}`);
+  console.log(`✨ ${BOT_NAME} | DE/EN | Production Ready`);
+  console.log(`🛡️ Conservative: Confidence >0.75 | 1h Message Age | Critical Problems Alerts`);
+  console.log(`🤖 Manual Override: 30min Silence | 3min Buffer`);
   startPolling();
 });
 
