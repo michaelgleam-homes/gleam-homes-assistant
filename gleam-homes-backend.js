@@ -202,7 +202,6 @@ const FAQ_DATABASE_EN = {
 
 // ─── IMPROVED MESSAGE FILTERING ──────────────────────────────────────────
 function shouldIgnoreMessage(text) {
-  // Match danke/thanks/ok/ja ANYWHERE in text
   const ignorePatterns = [
     /danke|thanks|thank you|ok|okay|alles klar|all good|👍|👌/i,
     /^(ja|yes|yep|sure|klar|natürlich|gerne|si|da|tak|да)$/i,
@@ -292,7 +291,6 @@ async function processGuestMessage(guestName, guestQuestion, apartmentName, isSt
     return { type: 'IGNORE' };
   }
 
-  // CRITICAL PROBLEMS: Alert only, no auto-response
   if (isCriticalProblem(guestQuestion)) {
     await sendNtfyAlert(`🚨 KRITISCH: ${firstName}`, guestQuestion, 'urgent');
     await sendAlertEmail(guestName, guestQuestion, 'CRITICAL', apartmentName);
@@ -315,4 +313,182 @@ async function processGuestMessage(guestName, guestQuestion, apartmentName, isSt
   const language = detectLanguage(guestQuestion);
   const { faq, confidence } = categorizeQuestion(guestQuestion, language);
 
-  // CONSERVATIVE: >0.75 thr
+  if (confidence > CONFIDENCE_THRESHOLD) {
+    return { type: 'AUTO_RESPONSE', message: faq.response(firstName) };
+  }
+
+  await sendNtfyAlert(`❓ FRAGE: ${firstName}`, guestQuestion);
+  await sendAlertEmail(guestName, guestQuestion, 'QUESTION', apartmentName);
+  const fallback = language === 'en'
+    ? `Hi ${firstName},\n\nthanks for your question! Michael will reach out personally.\n\n${SIGNATURE_EN}`
+    : `Hallo ${firstName},\n\nvielen Dank für deine Frage! Michael meldet sich persönlich.\n\n${SIGNATURE_DE}`;
+  return { type: 'FALLBACK_WITH_ALERT', message: fallback };
+}
+
+// ─── SMOOBU API ──────────────────────────────────────────────────────────
+const smoobuHeaders = {
+  'Api-Key': SMOOBU_API_KEY,
+  'Content-Type': 'application/json',
+  'Cache-Control': 'no-cache'
+};
+
+async function getActiveReservations(apartmentId) {
+  try {
+    const today = new Date();
+    const from = new Date(today);
+    from.setDate(from.getDate() - 7);
+    const to = new Date(today);
+    to.setDate(to.getDate() + 30);
+
+    const response = await axios.get(`${SMOOBU_BASE}/reservations`, {
+      headers: smoobuHeaders,
+      params: {
+        apartmentId,
+        from: from.toISOString().split('T')[0],
+        to: to.toISOString().split('T')[0],
+        pageSize: 20,
+        excludeBlocked: true
+      }
+    });
+
+    return response.data?.bookings || [];
+  } catch (error) {
+    console.error(`❌ Buchungen:`, error.response?.status);
+    return [];
+  }
+}
+
+async function getReservationMessages(reservationId) {
+  try {
+    const response = await axios.get(
+      `${SMOOBU_BASE}/reservations/${reservationId}/messages`,
+      { headers: smoobuHeaders }
+    );
+    return response.data?.messages || [];
+  } catch (error) {
+    return [];
+  }
+}
+
+async function sendMessageToGuest(reservationId, messageBody) {
+  try {
+    const response = await axios.post(
+      `${SMOOBU_BASE}/reservations/${reservationId}/messages/send-message-to-guest`,
+      { messageBody },
+      { headers: smoobuHeaders }
+    );
+    console.log(`✅ ${reservationId}`);
+    return { success: true };
+  } catch (error) {
+    console.error(`❌ Send:`, error.response?.status);
+    return { success: false };
+  }
+}
+
+// ─── POLLING ─────────────────────────────────────────────────────────────
+async function pollAllApartments() {
+  console.log(`\n🔄 Polling: ${new Date().toLocaleTimeString('de-DE')}`);
+
+  for (const apt of APARTMENTS) {
+    const bookings = await getActiveReservations(apt.id);
+    console.log(`🏠 ${apt.name}: ${bookings.length} Buchungen`);
+
+    for (const booking of bookings) {
+      const firstName = booking['guest-name'].split(' ')[0];
+      const bookingId = booking.id;
+      const now = new Date();
+
+      if (lastBotResponseTime.has(bookingId)) {
+        const lastResponseTime = lastBotResponseTime.get(bookingId);
+        const secondsSinceResponse = (now - lastResponseTime) / 1000;
+        if (secondsSinceResponse < 3 * 60) {
+          continue;
+        }
+      }
+
+      const messages = await getReservationMessages(bookingId);
+      if (!messages.length) continue;
+
+      const lastMsg = messages[messages.length - 1];
+      if (!lastMsg || !lastMsg.message) continue;
+
+      const msgId = `${bookingId}-${lastMsg.id}`;
+      if (processedMessageIds.has(msgId)) continue;
+
+      const text = lastMsg.message?.trim();
+      if (!text) continue;
+
+      if (isMessageTooOld(lastMsg.created || lastMsg.createdAt)) {
+        processedMessageIds.add(msgId);
+        console.log(`  ⊘ ${firstName}: Zu alt (>1h)`);
+        continue;
+      }
+
+      if (lastMsg.type === 2) {
+        const guestMessageExists = messages.length > 1 && messages[messages.length - 2]?.type === 1;
+        
+        if (guestMessageExists) {
+          const guestMsg = messages[messages.length - 2];
+          const guestMsgId = `${bookingId}-${guestMsg.id}`;
+          processedMessageIds.add(guestMsgId);
+          processedMessageIds.add(msgId);
+          console.log(`  ✅ ${firstName}: Michael hat geantwortet - Lisa schweigt DAUERHAFT`);
+          continue;
+        } else {
+          processedMessageIds.add(msgId);
+          console.log(`  ⊘ ${firstName}: Nur Buchungsbestätigung`);
+          continue;
+        }
+      }
+
+      const result = await processGuestMessage(booking['guest-name'], text, apt.name, booking.type === 'cancellation');
+
+      if (result.message) {
+        const sent = await sendMessageToGuest(bookingId, result.message);
+        if (sent.success) {
+          processedMessageIds.add(msgId);
+          lastBotResponseTime.set(bookingId, now);
+          console.log(`  → ${firstName}: ${result.type}`);
+        }
+      } else {
+        processedMessageIds.add(msgId);
+        console.log(`  → ${firstName}: ${result.type}`);
+      }
+    }
+  }
+}
+
+function startPolling() {
+  console.log(`⏱️ Polling alle ${POLL_INTERVAL_MS / 60000}min`);
+  console.log(`🔧 v2.10: FIXED - When Michael responds, Lisa NEVER responds to that message`);
+  console.log(`✅ LOGIC: Age Check → Michael Response? → Process → PERMANENT SILENCE`);
+  pollAllApartments();
+  setInterval(pollAllApartments, POLL_INTERVAL_MS);
+}
+
+// ─── ENDPOINTS ───────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    version: '2.10',
+    apartments: APARTMENTS.length,
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.post('/poll/now', async (req, res) => {
+  await pollAllApartments();
+  res.json({ success: true });
+});
+
+// ─── START ───────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`\n🚀 GLEAM HOMES v2.10 auf Port ${PORT}`);
+  console.log(`✨ ${BOT_NAME} | DE/EN | Production Ready`);
+  console.log(`🛡️ CRITICAL FIX: When Michael responds → Lisa NEVER responds to that message (PERMANENT)`);
+  console.log(`✅ FEATURES: Critical Problems, Conservative Threshold, Permanent Silence, 1h Age Filter`);
+  startPolling();
+});
+
+module.exports = app;
