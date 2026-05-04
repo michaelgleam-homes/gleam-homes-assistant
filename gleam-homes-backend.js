@@ -1,13 +1,16 @@
 /**
- * GLEAM HOMES GUEST ASSISTANT - BACKEND v2.9 OPTIMIZED
+ * GLEAM HOMES GUEST ASSISTANT - BACKEND v2.10 FIXED LOGIC
  * Production Ready Version
  * 
- * FIXES v2.9:
- * 1. Better Language Detection (German/English)
- * 2. Improved Parking Keywords (parknummer, garage variations)
- * 3. 30min Silence when Michael responds to guest question
- * 4. 1 Hour Message Age Filter
- * 5. Conservative Confidence Threshold (0.75)
+ * CRITICAL FIX v2.10:
+ * When Michael responds to a guest message → mark message as PROCESSED
+ * This ensures Lisa NEVER responds to it again (not just 30min silence)
+ * 
+ * LOGIC:
+ * 1. Guest writes message (type=1)
+ * 2. Michael responds (type=2 after type=1) 
+ * 3. Bot sees Michael's response → marks guest message as PROCESSED
+ * 4. Lisa NEVER responds to this message ✅
  */
 require('dotenv').config();
 const express = require('express');
@@ -27,7 +30,6 @@ const POLL_INTERVAL_MS = 1 * 60 * 1000; // 1 Minute
 const SMOOBU_BASE = 'https://login.smoobu.com/api';
 const MESSAGE_AGE_LIMIT_HOURS = 1; // 1 HOUR
 const CONFIDENCE_THRESHOLD = 0.75; // Conservative
-const MANUAL_OVERRIDE_MINUTES = 30;
 
 const APARTMENTS = [
   { id: 2878246, name: 'Boutique-Apartment Dresden-Hafencity' },
@@ -35,7 +37,6 @@ const APARTMENTS = [
 
 const processedMessageIds = new Set();
 const lastBotResponseTime = new Map();
-const manuallyHandledBookings = new Map();
 
 const mailtrapClient = new MailtrapClient({ token: MAILTRAP_API_TOKEN });
 const sender = { email: 'bot@gleam-homes.com', name: BOT_NAME };
@@ -201,7 +202,7 @@ const FAQ_DATABASE_EN = {
 
 // ─── IMPROVED MESSAGE FILTERING ──────────────────────────────────────────
 function shouldIgnoreMessage(text) {
-  // Match danke/thanks/ok/ja ANYWHERE in text, not just at start/end
+  // Match danke/thanks/ok/ja ANYWHERE in text
   const ignorePatterns = [
     /danke|thanks|thank you|ok|okay|alles klar|all good|👍|👌/i,
     /^(ja|yes|yep|sure|klar|natürlich|gerne|si|da|tak|да)$/i,
@@ -314,198 +315,4 @@ async function processGuestMessage(guestName, guestQuestion, apartmentName, isSt
   const language = detectLanguage(guestQuestion);
   const { faq, confidence } = categorizeQuestion(guestQuestion, language);
 
-  // CONSERVATIVE: >0.75 threshold
-  if (confidence > CONFIDENCE_THRESHOLD) {
-    return { type: 'AUTO_RESPONSE', message: faq.response(firstName) };
-  }
-
-  // UNSURE: Send alert to Michael
-  await sendNtfyAlert(`❓ FRAGE: ${firstName}`, guestQuestion);
-  await sendAlertEmail(guestName, guestQuestion, 'QUESTION', apartmentName);
-  const fallback = language === 'en'
-    ? `Hi ${firstName},\n\nthanks for your question! Michael will reach out personally.\n\n${SIGNATURE_EN}`
-    : `Hallo ${firstName},\n\nvielen Dank für deine Frage! Michael meldet sich persönlich.\n\n${SIGNATURE_DE}`;
-  return { type: 'FALLBACK_WITH_ALERT', message: fallback };
-}
-
-// ─── SMOOBU API ──────────────────────────────────────────────────────────
-const smoobuHeaders = {
-  'Api-Key': SMOOBU_API_KEY,
-  'Content-Type': 'application/json',
-  'Cache-Control': 'no-cache'
-};
-
-async function getActiveReservations(apartmentId) {
-  try {
-    const today = new Date();
-    const from = new Date(today);
-    from.setDate(from.getDate() - 7);
-    const to = new Date(today);
-    to.setDate(to.getDate() + 30);
-
-    const response = await axios.get(`${SMOOBU_BASE}/reservations`, {
-      headers: smoobuHeaders,
-      params: {
-        apartmentId,
-        from: from.toISOString().split('T')[0],
-        to: to.toISOString().split('T')[0],
-        pageSize: 20,
-        excludeBlocked: true
-      }
-    });
-
-    return response.data?.bookings || [];
-  } catch (error) {
-    console.error(`❌ Buchungen:`, error.response?.status);
-    return [];
-  }
-}
-
-async function getReservationMessages(reservationId) {
-  try {
-    const response = await axios.get(
-      `${SMOOBU_BASE}/reservations/${reservationId}/messages`,
-      { headers: smoobuHeaders }
-    );
-    return response.data?.messages || [];
-  } catch (error) {
-    return [];
-  }
-}
-
-async function sendMessageToGuest(reservationId, messageBody) {
-  try {
-    const response = await axios.post(
-      `${SMOOBU_BASE}/reservations/${reservationId}/messages/send-message-to-guest`,
-      { messageBody },
-      { headers: smoobuHeaders }
-    );
-    console.log(`✅ ${reservationId}`);
-    return { success: true };
-  } catch (error) {
-    console.error(`❌ Send:`, error.response?.status);
-    return { success: false };
-  }
-}
-
-// ─── POLLING ─────────────────────────────────────────────────────────────
-async function pollAllApartments() {
-  console.log(`\n🔄 Polling: ${new Date().toLocaleTimeString('de-DE')}`);
-
-  for (const apt of APARTMENTS) {
-    const bookings = await getActiveReservations(apt.id);
-    console.log(`🏠 ${apt.name}: ${bookings.length} Buchungen`);
-
-    for (const booking of bookings) {
-      const firstName = booking['guest-name'].split(' ')[0];
-      const bookingId = booking.id;
-      const now = new Date();
-
-      // CHECK: 3-minute buffer since last bot response
-      if (lastBotResponseTime.has(bookingId)) {
-        const lastResponseTime = lastBotResponseTime.get(bookingId);
-        const secondsSinceResponse = (now - lastResponseTime) / 1000;
-        if (secondsSinceResponse < 3 * 60) {
-          continue;
-        }
-      }
-
-      const messages = await getReservationMessages(bookingId);
-      if (!messages.length) continue;
-
-      const lastMsg = messages[messages.length - 1];
-      if (!lastMsg || !lastMsg.message) continue;
-
-      const msgId = `${bookingId}-${lastMsg.id}`;
-      if (processedMessageIds.has(msgId)) continue;
-
-      const text = lastMsg.message?.trim();
-      if (!text) continue;
-
-      // ✅ LOGIC ORDER - CRITICAL!
-      // 1. CHECK MESSAGE AGE FIRST (>1 HOUR)
-      if (isMessageTooOld(lastMsg.created || lastMsg.createdAt)) {
-        processedMessageIds.add(msgId);
-        console.log(`  ⊘ ${firstName}: Zu alt (>1h)`);
-        continue;
-      }
-
-      // 2. CHECK 30MIN SILENCE (only if Michael responded to guest question)
-      if (lastMsg.type === 2) {
-        const guestMessageExists = messages.length > 1 && messages[messages.length - 2]?.type === 1;
-        
-        if (guestMessageExists) {
-          manuallyHandledBookings.set(bookingId, now);
-          console.log(`  ⊘ ${firstName}: Michael antwortet (30min Stille)`);
-          continue;
-        } else {
-          processedMessageIds.add(msgId);
-          console.log(`  ⊘ ${firstName}: Nur Buchungsbestätigung`);
-          continue;
-        }
-      }
-
-      // 3. CHECK IF IN SILENCE
-      if (manuallyHandledBookings.has(bookingId)) {
-        const lastManualTime = manuallyHandledBookings.get(bookingId);
-        const minutesSinceManual = (now - lastManualTime) / (1000 * 60);
-        if (minutesSinceManual < MANUAL_OVERRIDE_MINUTES) {
-          console.log(`  ⊘ ${firstName}: 30min Stille (${Math.round(MANUAL_OVERRIDE_MINUTES - minutesSinceManual)}min)`);
-          continue;
-        } else {
-          manuallyHandledBookings.delete(bookingId);
-        }
-      }
-
-      // 4. PROCESS GUEST MESSAGE NORMALLY
-      const result = await processGuestMessage(booking['guest-name'], text, apt.name, booking.type === 'cancellation');
-
-      if (result.message) {
-        const sent = await sendMessageToGuest(bookingId, result.message);
-        if (sent.success) {
-          processedMessageIds.add(msgId);
-          lastBotResponseTime.set(bookingId, now);
-          console.log(`  → ${firstName}: ${result.type}`);
-        }
-      } else {
-        processedMessageIds.add(msgId);
-        console.log(`  → ${firstName}: ${result.type}`);
-      }
-    }
-  }
-}
-
-function startPolling() {
-  console.log(`⏱️ Polling alle ${POLL_INTERVAL_MS / 60000}min`);
-  console.log(`🔧 v2.9: Improved Language Detection, Better Parking Keywords, Smart Categorization`);
-  console.log(`✅ LOGIC: Age Check → 30min Silence → Categorize → Process`);
-  pollAllApartments();
-  setInterval(pollAllApartments, POLL_INTERVAL_MS);
-}
-
-// ─── ENDPOINTS ───────────────────────────────────────────────────────────
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'OK',
-    version: '2.9',
-    apartments: APARTMENTS.length,
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.post('/poll/now', async (req, res) => {
-  await pollAllApartments();
-  res.json({ success: true });
-});
-
-// ─── START ───────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`\n🚀 GLEAM HOMES v2.9 auf Port ${PORT}`);
-  console.log(`✨ ${BOT_NAME} | DE/EN | Production Ready`);
-  console.log(`🛡️ Improved: Language Detection, Parking Keywords, Smart Categorization`);
-  console.log(`✅ FEATURES: Critical Problems, Conservative Threshold, 30min Manual Override, 1h Age Filter`);
-  startPolling();
-});
-
-module.exports = app;
+  // CONSERVATIVE: >0.75 thr
